@@ -53,9 +53,9 @@ Operators declare these mappings in `configtx.yaml`:
 ```yaml
 ACLs:
   # ACL policy for the Query "GetTransactionStatus" function.
-  /servicepb/QueryService/GetTransactionStatus: /Channel/Application/Readers
+  /servicepb.QueryService/GetTransactionStatus: /Channel/Application/Readers
   # ACL policy for the BlockQuery "GetBlockByNumber" function.
-  /servicepb/BlockQueryService/GetBlockByNumber: /Channel/Application/Readers
+  /servicepb.BlockQueryService/GetBlockByNumber: /Channel/Application/Readers
 ```
 
 When a client invokes one of these methods, 
