@@ -53,9 +53,9 @@ Operators declare these mappings in `configtx.yaml`:
 ```yaml
 ACLs:
   # ACL policy for the Query "GetTransactionStatus" function.
-  query/GetTransactionStatus: /Channel/Application/Readers
+  /servicepb/QueryService/GetTransactionStatus: /Channel/Application/Readers
   # ACL policy for the BlockQuery "GetBlockByNumber" function.
-  blockquery/GetBlockByNumber: /Channel/Application/Readers
+  /servicepb/BlockQueryService/GetBlockByNumber: /Channel/Application/Readers
 ```
 
 When a client invokes one of these methods, 
@@ -192,83 +192,88 @@ A typed wrapper—rather than a raw `common.Envelope` — is used so the gRPC la
 
 ```go
 func (s *Server) ACLInterceptor(
-ctx context.Context,
-req interface{},
-info *grpc.UnaryServerInfo,
-handler grpc.UnaryHandler,
+    ctx context.Context,
+    req interface{},
+    info *grpc.UnaryServerInfo,
+    handler grpc.UnaryHandler,
 ) (interface{}, error) {
 
-// 1. The request must contain a signed common.Envelope.
-typedMessage, ok := req.(*common.TypedMessage)
-if !ok {
-return nil, status.Error(codes.InvalidArgument,
-"request must be a typed common.TypedMessage")
-}
+    // 1. The request must contain a signed common.Envelope.
+    typedMessage, ok := req.(*common.TypedMessage)
+    if !ok {
+        return nil, status.Error(codes.InvalidArgument,
+        "request must be a typed common.TypedMessage")
+    }
+    
+    envelope, ok := getEnvelopeFromMsg(typedMessage)
+    if !ok {
+        return nil, status.Error(codes.InvalidArgument,
+        "request must be a signed common.Envelope")
+    }
+    
+    payload, err := protoutil.UnmarshalPayload(envelope.Payload)
+    if err != nil {
+        return nil, status.Errorf(codes.InvalidArgument,
+        "failed to unmarshal payload: %v", err)
+    }
+    
+    chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+    if err != nil {
+        return nil, status.Errorf(codes.InvalidArgument,
+        "failed to unmarshal channel header: %v", err)
+    }
+    
+    // Verify TLS cert hash binding.
+    if s.mutualTLS {
+        claimedHash := chdr.TlsCertHash
+        if len(claimedHash) == 0 {
+            return nil, status.Error(codes.Unauthenticated,
+            "client didn't include TLS cert hash")
+    }
+    
+    actualHash := util.ExtractCertificateHashFromContext(ctx)
+    if len(actualHash) == 0 {
+        return nil, status.Error(codes.Unauthenticated,
+        "client didn't send a TLS certificate")
+    }
+    
+    if !bytes.Equal(actualHash, claimedHash) {
+        return nil, status.Errorf(codes.Unauthenticated,
+        "TLS cert hash mismatch: claimed=%x, actual=%x",
+        claimedHash, actualHash)
+    }
+    
+    // 2. Extract SignedData: serialized identity + signature + payload.
+    signedData, err := protoutil.EnvelopeAsSignedData(envelope)
+    if err != nil {
+        return nil, status.Errorf(codes.InvalidArgument,
+        "failed to extract signed data: %v", err)
+    }
 
-envelope, ok := getEnvelopeFromMsg(typedMessage)
-if !ok {
-return nil, status.Error(codes.InvalidArgument,
-"request must be a signed common.Envelope")
-}
-
-payload, err := protoutil.UnmarshalPayload(envelope.Payload)
-if err != nil {
-return nil, status.Errorf(codes.InvalidArgument,
-"failed to unmarshal payload: %v", err)
-}
-
-chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-if err != nil {
-return nil, status.Errorf(codes.InvalidArgument,
-"failed to unmarshal channel header: %v", err)
-}
-
-// Verify TLS cert hash binding.
-if s.mutualTLS {
-claimedHash := chdr.TlsCertHash
-if len(claimedHash) == 0 {
-return nil, status.Error(codes.Unauthenticated,
-"client didn't include TLS cert hash")
-}
-
-actualHash := util.ExtractCertificateHashFromContext(ctx)
-if len(actualHash) == 0 {
-return nil, status.Error(codes.Unauthenticated,
-"client didn't send a TLS certificate")
-}
-
-if !bytes.Equal(actualHash, claimedHash) {
-return nil, status.Errorf(codes.Unauthenticated,
-"TLS cert hash mismatch: claimed=%x, actual=%x",
-claimedHash, actualHash)
-}
-}
-
-// 2. Extract SignedData: serialized identity + signature + payload.
-signedData, err := protoutil.EnvelopeAsSignedData(envelope)
-if err != nil {
-return nil, status.Errorf(codes.InvalidArgument,
-"failed to extract signed data: %v", err)
-}
-
-// 3. Map the gRPC method to an ACL resource name and retrieve
-//    the corresponding policy from the channel config bundle.
-resource := methodToResource(info.FullMethod)
-policyMgr := s.currentBundle.PolicyManager()
-policy, exists := policyMgr.GetPolicy(resource)
-if !exists {
-return nil, status.Errorf(codes.PermissionDenied,
-"no policy defined for resource: %s", resource)
-}
-
-// 4. Evaluate: verify the signature and validate the identity
-//    against the channel's MSP definitions.
-if err := policy.EvaluateSignedData(signedData); err != nil {
-return nil, status.Errorf(codes.PermissionDenied,
-"ACL check failed for [%s]: %v", resource, err)
-}
-
-return handler(ctx, req)
+    appConfig, exists := bundle.ApplicationConfig()
+    if !exists {
+        return nil, status.Error(codes.Internal, "no application config in bundle")
+    }
+    
+    // 3. Map the gRPC method to an ACL resource name and retrieve
+    //    the corresponding policy from the channel config bundle.
+	resourcePolicy := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
+	
+    policyMgr := s.currentBundle.PolicyManager()
+    policy, exists := policyMgr.GetPolicy(resourcePolicy)
+    if !exists {
+        return nil, status.Errorf(codes.PermissionDenied,
+        "no policy defined for resource: %s", resource)
+    }
+    
+    // 4. Evaluate: verify the signature and validate the identity
+    //    against the channel's MSP definitions.
+    if err := policy.EvaluateSignedData(signedData); err != nil {
+        return nil, status.Errorf(codes.PermissionDenied,
+        "ACL check failed for [%s]: %v", resource, err)
+    }
+    
+    return handler(ctx, req)
 }
 ```
 
@@ -289,84 +294,95 @@ being removed from the channel.
 
 ```go
 func (s *Server) ACLStreamInterceptor(
-srv interface{},
-ss grpc.ServerStream,
-info *grpc.StreamServerInfo,
-handler grpc.StreamHandler,
+    srv interface{},
+    ss grpc.ServerStream,
+    info *grpc.StreamServerInfo,
+    handler grpc.StreamHandler,
 ) error {
-ctx := ss.Context()
+    ctx := ss.Context()
 
-// 1. Receive first envelope and validate TLS binding.
-var firstEnvelope *common.Envelope
-if err := ss.RecvMsg(&firstEnvelope); err != nil {
-return status.Errorf(codes.InvalidArgument,
-"failed to receive first envelope: %v", err)
-}
+    // 1. Receive first envelope and validate TLS binding.
+    var firstEnvelope *common.Envelope
+    if err := ss.RecvMsg(&firstEnvelope); err != nil {
+        return status.Errorf(codes.InvalidArgument,
+        "failed to receive first envelope: %v", err)
+    }
 
-payload, err := protoutil.UnmarshalPayload(firstEnvelope.Payload)
-if err != nil {
-return status.Errorf(codes.InvalidArgument,
-"failed to unmarshal payload: %v", err)
-}
+    payload, err := protoutil.UnmarshalPayload(firstEnvelope.Payload)
+    if err != nil {
+        return status.Errorf(codes.InvalidArgument,
+        "failed to unmarshal payload: %v", err)
+    }
 
-chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-if err != nil {
-return status.Errorf(codes.InvalidArgument,
-"failed to unmarshal channel header: %v", err)
-}
+    chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
+    if err != nil {
+        return status.Errorf(codes.InvalidArgument,
+        "failed to unmarshal channel header: %v", err)
+    }
 
-if s.mutualTLS {
-claimedHash := chdr.TlsCertHash
-actualHash := util.ExtractCertificateHashFromContext(ctx)
+    if s.mutualTLS {
+        claimedHash := chdr.TlsCertHash
+        actualHash := util.ExtractCertificateHashFromContext(ctx)
+        if len(actualHash) == 0 {
+            return status.Error(codes.Unauthenticated,
+            "client didn't send a TLS certificate")
+    }
 
-actualHash := util.ExtractCertificateHashFromContext(ctx)
-if len(actualHash) == 0 {
-return nil, status.Error(codes.Unauthenticated,
-"client didn't send a TLS certificate")
-}
+    if !bytes.Equal(actualHash, claimedHash) {
+        return status.Error(codes.Unauthenticated,
+        "TLS cert hash mismatch")
+        }
+    }
 
-if !bytes.Equal(actualHash, claimedHash) {
-return status.Errorf(codes.Unauthenticated,
-"TLS cert hash mismatch")
-}
-}
+    // 2. Extract identity for ACL check.
+    signedData, err := protoutil.EnvelopeAsSignedData(firstEnvelope)
+    if err != nil {
+        return status.Errorf(codes.InvalidArgument,
+        "failed to extract signed data: %v", err)
+    }
 
-// 2. Extract identity for ACL check.
-signedData, err := protoutil.EnvelopeAsSignedData(firstEnvelope)
-if err != nil {
-return status.Errorf(codes.InvalidArgument,
-"failed to extract signed data: %v", err)
-}
 
-// 3. Initial ACL check.
-resource := methodToResource(info.FullMethod)
-currentSeq := s.currentBundle.ConfigtxValidator().Sequence()
+    appConfig, exists := s.currentBundle.ApplicationConfig()
+    if !exists {
+        return nil, status.Error(codes.Internal, "no application config in bundle")
+    }
+    
+    // 3. Map the gRPC method to an ACL resource name and retrieve
+    //    the corresponding policy from the channel config bundle.
+    resourcePolicy := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
+    
+    policyMgr := s.currentBundle.PolicyManager()
+    policy, exists := policyMgr.GetPolicy(resourcePolicy)
+    if !exists {
+        return nil, status.Errorf(codes.PermissionDenied,
+        "no policy defined for resource: %s", resource)
+    }
 
-policyMgr := s.currentBundle.PolicyManager()
-policy, exists := policyMgr.GetPolicy(resource)
-if !exists {
-return status.Errorf(codes.PermissionDenied,
-"no policy for resource: %s", resource)
-}
+    policyMgr := s.currentBundle.PolicyManager()
+    policy, exists := policyMgr.GetPolicy(policy)
+    if !exists {
+        return status.Errorf(codes.PermissionDenied,
+        "no policy for resource: %s", resource)
+    }
 
-if err := policy.EvaluateSignedData(signedData); err != nil {
-return status.Errorf(codes.PermissionDenied,
-"ACL check failed: %v", err)
-}
+    if err := policy.EvaluateSignedData(signedData); err != nil {
+        return status.Errorf(codes.PermissionDenied,
+        "ACL check failed: %v", err)
+    }
 
-// 4. Cache identity and sequence for subsequent messages.
-session := &SessionAccessControl{
-signedData:     signedData,
-configSequence: currentSeq,
-resource:       resource,
-tlsCertHash:    chdr.TlsCertHash,
-}
+    // 4. Cache identity and sequence for subsequent messages.
+    session := &SessionAccessControl{
+        signedData:     signedData,
+        configSequence: s.currentBundle.ConfigtxValidator().Sequence(),
+        resource:       resource,
+        tlsCertHash:    chdr.TlsCertHash,
+    }
 
-return handler(srv, &aclServerStream{
-ServerStream: ss,
-server:       s,
-session:      session,
-})
+    return handler(srv, &aclServerStream{
+        ServerStream: ss,
+        server:       s,
+        session:      session,
+    })
 }
 ```
 
@@ -481,6 +497,200 @@ As a result:
 - The **MSP signing certificate** signs proposals and envelopes. It is issued by the organization's MSP CA and proves organizational identity.
 
 Option B requires either embedding organizational identity into the TLS certificate or issuing the TLS certificate from a CA trusted by the MSP.
+
+
+## Option C — Authentication RPC For Identity Resolution
+
+Option C is a hybrid approach in which the client first calls a dedicated `Authorize(signedEnvelope)` RPC, presenting its signed envelope there. This requires introducing a new `AuthService` and a corresponding proto file, but crucially, it does not introduce breaking changes to any existing service APIs.
+
+This option utilizes the `BundleProvider` and interceptor architecture, with the interceptor logic branching based on the specific gRPC method being invoked.
+
+### Execution Flow
+
+To map a single authenticated identity across multiple RPCs without requiring an envelope on every call, we leverage gRPC's ability to maintain connection-scoped state:
+
+1. **Custom Handshake**: A custom `TransportCredentials` wrapper intercepts the TLS `ServerHandshake`. During the handshake, it creates and injects a custom, mutable `MSPAuthInfo` struct into the connection's underlying context.
+
+2. **Identity Resolution**: The `AuthService` is registered on the same gRPC server. When a client invokes the `Authorize` RPC, the interceptor extracts the client's identity from the signed envelope and safely binds it to the `MSPAuthInfo` struct.
+
+3. **Evaluation**: Because the identity is now bound to that physical session, for every subsequent RPC, the interceptor simply reads the pre-resolved client identity from the connection's `MSPAuthInfo` and evaluates it against the channel's policies.
+
+
+### Custom AuthInfo Structure and TransportCredentials Wrapper
+
+```go
+type MSPAuthInfo struct {
+    mu             sync.RWMutex
+    MSPIdentity    msp.Identity      // Bound after Authorize
+    ConfigSequence uint64             // Config version
+    TLSInfo        credentials.TLSInfo
+}
+
+func (a *MSPAuthInfo) GetIdentity() (msp.Identity, uint64) {
+    a.mu.RLock()
+    defer a.mu.RUnlock()
+    return a.MSPIdentity, a.ConfigSequence
+}
+
+// SetIdentity binds an MSP identity to this connection.
+func (m *MSPAuthInfo) SetIdentity(identity msp.Identity, sequence uint64) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    m.MSPIdentity = identity
+    m.ConfigSequence = sequence
+}
+
+type CustomCredentials struct {
+    tlsCreds credentials.TransportCredentials
+}
+
+func (c *CustomCredentials) ServerHandshake(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
+    logger.Infof("Performing TLS handshake from: %s\n", rawConn.RemoteAddr().String())
+    
+    // Delegate to the underlying TLS credentials to perform the handshake
+    conn, tlsAuthInfo, err := c.tlsCreds.ServerHandshake(rawConn)
+    if err != nil {
+        return nil, nil, fmt.Errorf("TLS handshake failed: %w", err)
+    }
+    
+    return conn, &MSPAuthInfo{
+        TLSInfo: tlsAuthInfo,
+    }, nil
+}
+```
+
+### Interceptor Logic
+
+```go
+func MSPUnaryServerInterceptor(provider BundleProvider) grpc.UnaryServerInterceptor {
+    return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, 
+                handler grpc.UnaryHandler) (interface{}, error) {
+        
+        authInfo := extractMSPAuthInfo(ctx)
+        
+        // Handle Authorize RPC
+        if strings.EqualFold(info.FullMethod, "/servicepb.AuthService/Authorize") {
+            bundle, err := provider.GetBundle()
+			if errors.Is(err, ErrNoUpdater) {
+                // Internal service - should not call Authorize
+                return &AuthorizeResponse{
+                    Success: false, 
+                    Message: "Not available for internal services",
+                }, nil
+            }
+            if err != nil {
+                // Configuration problem
+                return &AuthorizeResponse{
+                    Success: false, 
+                    Message: "Channel configuration not available",
+                }, nil
+            }
+            
+            // Extract and validate identity from signed envelope
+            identity, mspID, err := ExtractIdentityFromEnvelope(
+                req.SignedEnvelope, 
+                bundle,
+            )
+            if err != nil {
+                return &AuthorizeResponse{
+                    Success: false, 
+                    Message: "Identity validation failed: " + err.Error(),
+                }, nil
+            }
+
+            authInfo.SetIdentity(identity, bundle.ConfigtxValidator().Sequence())
+            
+            return handler(ctx, req)
+        }
+		
+        bundle, err := provider.GetBundle()
+        if errors.Is(err, ErrNoUpdater) {
+            // Internal service - bypass authentication
+            return handler(ctx, req)
+        }
+        if err != nil {
+            // Public service with missing config - fail
+            return nil, status.Error(codes.Internal, 
+                "channel configuration not available")
+        }
+        
+        // Public service - enforce ACL
+        identity, configSeq := authInfo.GetIdentity()
+        
+        // Check if identity is bound
+        if identity == nil {
+            return nil, status.Error(codes.Unauthenticated, 
+                "connection not authorized: call Authorize RPC first")
+        }
+
+        appConfig, exists := bundle.ApplicationConfig()
+        if !exists {
+            return nil, status.Error(codes.Internal, "no application config in bundle")
+        }
+        policyRef := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
+		
+        // Evaluate against policy
+        policyMgr := bundle.PolicyManager()
+        policy, exists := policyMgr.GetPolicy(policyRef)
+        if !exists {
+            return nil, status.Error(codes.PermissionDenied, 
+                "no policy defined for resource")
+        }
+        
+        if err := policy.EvaluateIdentities([]msp.Identity{identity}); err != nil {
+            return nil, status.Errorf(codes.PermissionDenied, 
+                "access denied for %s: %v", info.FullMethod, err)
+        }
+        
+        return handler(ctx, req)
+    }
+}
+
+
+func MSPStreamServerInterceptor(provider BundleProvider) grpc.StreamServerInterceptor {
+    return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
+        ctx := ss.Context()
+        authInfo := extractMSPAuthInfo(ctx)
+        
+        // Check service type
+        bundle, err := provider.GetBundle()
+            if errors.Is(err, ErrNoUpdater) {
+            // Internal service - bypass authentication
+            return handler(srv, ss)
+        }
+        if err != nil {
+            return status.Error(codes.Internal, "channel configuration not available")
+        }
+        
+        // Public service - enforce ACL
+        identity, _ := authInfo.GetIdentity()
+        if identity == nil {
+            return status.Error(codes.Unauthenticated,
+				"connection not authorized: call Authorize RPC first")
+        }
+
+        appConfig, exists := bundle.ApplicationConfig()
+        if !exists {
+          return nil, status.Error(codes.Internal, "no application config in bundle")
+        }
+        
+        policyRef := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
+		
+        policy, exists := bundle.PolicyManager().GetPolicy(policyRef)
+        if !exists {
+            return status.Error(codes.PermissionDenied, "no policy defined")
+        }
+        
+        if err := policy.EvaluateIdentities([]msp.Identity{identity}); err != nil {
+            return status.Errorf(codes.PermissionDenied,
+            "access denied for %s: %v", info.FullMethod, err)
+        }
+        
+        return handler(srv, ss)
+    }
+}
+
+```
 
 # Drawbacks
 [drawbacks]: #drawbacks
