@@ -20,8 +20,9 @@ and are refreshed dynamically when new configuration blocks arrive.
 A hard-coded default resource-to-policy map serves as a fallback
 when the channel configuration mapping for a specific resource is missing.
 Two implementation options are presented for discussion:
-(A) wrapping requests in typed message with a signed `common.Envelope`,
-and (B) extracting client identity from the mTLS certificate at the transport layer.
+(A) wrapping every request in a typed message with a signed `common.Envelope`,
+and (B) a dedicated `Authorize` RPC that acquires the identity once per connection
+and binds it to the gRPC connection for all subsequent calls.
 
 # Motivation
 [motivation]: #motivation
@@ -44,7 +45,7 @@ The expected outcome is an enforcement layer in which (1) every exposed method h
 [guide-level-explanation]: #guide-level-explanation
 
 Every gRPC method exposed by a Committer-X service is governed by an **ACL resource name**.
-A resource name is a short, structured identifier such as `query/GetTransactionStatus` or `blockquery/GetBlockByNumber`.
+A resource name is a structured identifier defined by the following pattern: `{proto-directory}.{service-name}/{rpc-name}`.
 Each resource maps to a **policy** defined in the channel configuration,
 such as `/Channel/Application/Readers` or `/Channel/Application/Writers`.
 
@@ -58,18 +59,17 @@ ACLs:
   /servicepb.BlockQueryService/GetBlockByNumber: /Channel/Application/Readers
 ```
 
-When a client invokes one of these methods, 
+When a client invokes one of these methods,
 a gRPC interceptor on the server resolves the method to its resource name,
 looks up the policy in the current channel configuration bundle,
 and evaluates the client's identity against that policy.
 If the policy is satisfied, the call proceeds; otherwise the server returns `PermissionDenied`.
 
-Two components back this up at runtime:
+One main component back this up at runtime:
 
-- **ACL Provider** — holds the resource-to-policy map and runs the evaluation. If the channel configuration does not define a mapping for a given resource (because the operator did not add the entry in configtx.yaml), the provider falls back to a hard-coded global default map. This guarantees that no exposed method is ever left without an applicable policy.
-- **Bundle Manager** — holds the latest channel configuration bundle (MSP definitions, policy definitions, configuration sequence number). It plugs into Committer-X's existing dynamic root CA refresh path, which already monitors for configuration blocks. When a new configuration block arrives, the bundle reference is atomically swapped and later ACL checks evaluate against the new policies.
+- **ACL Provider** — holds the latest channel configuration bundle (MSP definitions, policy definitions, configuration sequence number). It utilizes the current Committer-X's existing dynamic root CA refresh path, which already monitors for configuration blocks. When a new configuration block arrives, the bundle reference is atomically swapped, and later ACL checks evaluate against the new policies.
 
-For unary RPCs, 
+For unary RPCs,
 evaluation runs once per call.
 For streaming RPCs (`blockDelivery`, `OpenNotificationStream`),
 the client is authorized
@@ -78,7 +78,7 @@ whenever the channel configuration changes during the stream's lifetime.
 If a re-check fails—for example,
 because the client's organization has been removed from the channel—the stream is terminated immediately.
 
-When the ACL check fails, 
+When the ACL check fails,
 the server returns a gRPC `PermissionDenied` status with a message identifying the resource.
 For example:
 
@@ -93,50 +93,41 @@ rpc error: code = PermissionDenied desc = ACL check failed for [query/GetTransac
 
 Each service that exposes APIs
 (currently the query service, and the sidecar's notification service, block query and block deliver)
-is given an `ACLProvider` instance composed of:
+is given an `ACLProvider` as described above.
 
-- A reference to the **global default resource-to-policy map** (hard-coded fallback, shared across all services in the process).
-- A reference to a `BundleManager` that exposes the current channel configuration bundle.
-
-The default map is global rather than per-service because resource names are namespaced by their service prefix (`query/`, `blockquery/`, `notify/`), and a single registry makes it easy to audit the full set of protected resources in one place.
-
-The `BundleManager` is updated by the same dynamic root CA refresh path that already watches for configuration blocks. On a new configuration block:
+The `ACLProvider` is updated by the same dynamic root CA refresh path that already watches for configuration blocks. On a new configuration block:
 
 1. A new bundle is constructed from the latest channel configuration.
-2. The bundle reference held by the `BundleManager` is atomically swapped.
-3. Active streams compare the configuration sequence on each later message and re-evaluate their cached identities if the sequence has advanced.
+2. The bundle reference held by the `ACLProvider` is atomically swapped.
+3. Active streams compare the configuration sequence on each subsequent send or receive and re-evaluate their cached identities if the sequence has advanced.
 
 The system always evaluates against the latest bundle observed.
 A stream that started milliseconds before a new configuration block arrived will,
-on its next received message, detect the sequence advance and re-evaluate the identity against the new policy.
-
-The bundle provides everything required for identity evaluation: the MSP definitions per organization, 
-the policy definitions, and the configuration sequence number used for cache invalidation.
+on its next sent or received message, detect the sequence advance and re-evaluate the identity against the new policy.
 
 ACL enforcement is executed via gRPC interceptors—one unary and one streaming—installed per service.
 The unary interceptor performs a full check on every call.
-The streaming interceptor performs a full check on the first message,
-caches the result keyed by session, and re-checks only when the bundle's configuration sequence advances.
+The streaming interceptor performs a full check when the stream is established,
+caches the result in a session object bound to the stream, and re-evaludate the identity only when the bundle's configuration sequence advances.
 
 ## Bootstrap
 
 ACL evaluation requires MSP definitions and policy definitions,
 which come from the channel configuration bundle.
 Before the running services have processed any configuration block,
-the `BundleManager` has nothing to evaluate against.
+the `ACLProvider` has nothing to evaluate against.
 
-Bootstrap is handled via the existing hard-coded genesis-block path. 
-The sidecar loads the genesis block, the block is committed,
-and the query service's bundle-construction mechanism then builds the initial bundle from that committed config block.
+Bootstrap is handled via the existing hard-coded genesis-block path.
+The sidecar receive the genesis block, and the block is committed.
+Then, the services' bundle-construction mechanism builds the initial bundle from that committed config block.
 Until this sequence completes, the exposed APIs have no usable bundle and ACL-protected methods will reject calls.
 This introduces a small, bounded delay in API availability between process start and first-bundle availability.
-Although the first block should always be the configuration block.
-Therefore, no useful information can be gained by the time it arrives.
+Since the first block is always the configuration block, no useful information is exposed before enforcement becomes active.
 
 ## Configuration
 
 Default mappings live in code.
-Operator-visible mappings live in `sampleconfig/configtx.yaml` in the `fabric-x-common` repository,
+Operator-visible mappings live in `{config-dir}/configtx.yaml` in the `fabric-x-common` repository,
 under the `ACLs` section.
 The lookup order at request time is:
 
@@ -147,10 +138,10 @@ If neither contains an entry for the requested resource, the request is rejected
 
 ## Identity Acquisition: Two Options
 
-The two options below differ exclusively in how the client's identity is obtained at the server.
-All policy lookups, evaluation, and response are identical.
-Streams have a small difference between the two methods.
-
+The two options below differ exclusively in how the client's identity is obtained at the server and how it is cached.
+All policy lookups, evaluation, and responses are identical.
+Option A carries a signed identity proof on every request;
+Option B acquires it once per connection through a dedicated `Authorize` RPC and binds it at the gRPC connection level.
 
 ### Option A — Signed Envelope (`common.Envelope`) Wrapping
 
@@ -165,26 +156,35 @@ A typed wrapper—rather than a raw `common.Envelope` — is used so the gRPC la
 - `notify.proto`
 - `block_query.proto`
 
+**Replay prevention.**
+Each envelope's `ChannelHeader` carries two pieces of information that together prevent replay attacks,
+even when mTLS is not enabled:
+
+- **Timestamp.** The `ChannelHeader.Timestamp` records when the signed envelope was created. The server validates it against the current time within a freshness window, so a captured envelope goes stale and cannot be replayed later — regardless of the TLS mode.
+- **TLS certificate hash.** When mTLS is enabled, `ChannelHeader.TlsCertHash` is compared against the actual TLS certificate hash of the presenting connection. A captured envelope therefore cannot be replayed from any other connection.
+
 **Pros.**
 
 - The full envelope (data + signature) travels in a single structure, making the cryptographic provenance of each request unambiguous.
-- The MSP signing identity is fully exercised, and the TLS certificate hash binding inside `ChannelHeader.TlsCertHash` prevents an envelope captured on one connection from being replayed on another.
+- The MSP signing identity is fully exercised on every call.
+- Replay is prevented by two independent mechanisms: timestamp freshness (always) and TLS certificate hash binding (under mTLS).
 
 **Cons.**
 
 - Requires coordinated breaking changes to three proto files and to every client.
 - Requires client-side boilerplate to wrap and sign each request.
-- **Replay protection depends on mTLS.** The envelope is bound to a specific connection only via the TLS certificate hash inside `ChannelHeader.TlsCertHash`. If mTLS is disabled, that hash cannot be verified and a captured envelope becomes replayable from any connection. mTLS is the default production setting for Committer-X deployments, so in practice this is not a gap, but it should be acknowledged.
+- The same connection repeatedly re-sends its identity proof to the server, call after call, even though the connection itself has not changed.
 
-**Execution flow.**
+**Execution flow (unary)**
 
 1. The interceptor unwraps the typed message and extracts the `common.Envelope`.
-2. The envelope payload is unmarshalled and the `ChannelHeader` is extracted.
-3. If mTLS is enabled, the claimed TLS certificate hash inside `ChannelHeader.TlsCertHash` is compared with the actual TLS certificate hash extracted from the gRPC context via `util.ExtractCertificateHashFromContext(ctx)`. A mismatch returns `codes.Unauthenticated`.
-4. `protoutil.EnvelopeAsSignedData()` extracts the serialized identity, payload, and signature into a `SignedData` structure.
-5. The interceptor maps `info.FullMethod` to an ACL resource name and looks up the policy in the bundle's `PolicyManager`.
-6. `policy.EvaluateSignedData(signedData)` verifies the signature and validates the identity against the channel's MSP definitions.
-7. On success, the handler is invoked.
+2. The envelope payload is unmarshalled and the `ChannelHeader` is extracted. It contains the TLS certificate hash and the timestamp at which the signed envelope was created.
+3. The timestamp is checked against the current time to ensure the envelope is recent and not a replay of an old request.
+4. If mTLS is enabled, the claimed TLS certificate hash inside `ChannelHeader.TlsCertHash` is compared with the actual TLS certificate hash extracted from the gRPC context via `util.ExtractCertificateHashFromContext(ctx)`. A mismatch returns `codes.Unauthenticated`.
+5. `protoutil.EnvelopeAsSignedData()` extracts the serialized identity, payload, and signature into a `SignedData` structure.
+6. The interceptor reads the resource-to-policy map from the latest bundle exposed by the bundle provider, maps `info.FullMethod` to its policy reference, and retrieves the policy from the bundle's `PolicyManager`.
+7. `policy.EvaluateSignedData(signedData)` verifies the signature and validates the identity against the channel's MSP definitions.
+8. If every step succeeds, the RPC handler is invoked, allowing the request to proceed.
 
 > The code snippets below are pseudocode illustrating the intended flow.
 
@@ -202,95 +202,112 @@ func (s *Server) ACLInterceptor(
     typedMessage, ok := req.(*common.TypedMessage)
     if !ok {
         return nil, status.Error(codes.InvalidArgument,
-        "request must be a typed common.TypedMessage")
+            "request must be a typed common.TypedMessage")
     }
-    
+
     envelope, ok := getEnvelopeFromMsg(typedMessage)
     if !ok {
         return nil, status.Error(codes.InvalidArgument,
-        "request must be a signed common.Envelope")
+            "request must be a signed common.Envelope")
     }
-    
+
     payload, err := protoutil.UnmarshalPayload(envelope.Payload)
     if err != nil {
         return nil, status.Errorf(codes.InvalidArgument,
-        "failed to unmarshal payload: %v", err)
+            "failed to unmarshal payload: %v", err)
     }
-    
+
     chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
     if err != nil {
         return nil, status.Errorf(codes.InvalidArgument,
-        "failed to unmarshal channel header: %v", err)
+            "failed to unmarshal channel header: %v", err)
     }
-    
-    // Verify TLS cert hash binding.
+
+    // 2. Verify envelope freshness (replay prevention, independent of mTLS).
+    if err := validateTimestamp(chdr.Timestamp, s.envelopeFreshnessWindow); err != nil {
+        return nil, status.Errorf(codes.Unauthenticated,
+            "envelope timestamp outside freshness window: %v", err)
+    }
+
+    // 3. Verify TLS cert hash binding (replay prevention across connections).
     if s.mutualTLS {
         claimedHash := chdr.TlsCertHash
         if len(claimedHash) == 0 {
             return nil, status.Error(codes.Unauthenticated,
-            "client didn't include TLS cert hash")
+                "client didn't include TLS cert hash")
+        }
+
+        actualHash := util.ExtractCertificateHashFromContext(ctx)
+        if len(actualHash) == 0 {
+            return nil, status.Error(codes.Unauthenticated,
+                "client didn't send a TLS certificate")
+        }
+
+        if !bytes.Equal(actualHash, claimedHash) {
+            return nil, status.Error(codes.Unauthenticated,
+                "TLS cert hash mismatch")
+        }
     }
-    
-    actualHash := util.ExtractCertificateHashFromContext(ctx)
-    if len(actualHash) == 0 {
-        return nil, status.Error(codes.Unauthenticated,
-        "client didn't send a TLS certificate")
-    }
-    
-    if !bytes.Equal(actualHash, claimedHash) {
-        return nil, status.Errorf(codes.Unauthenticated,
-        "TLS cert hash mismatch: claimed=%x, actual=%x",
-        claimedHash, actualHash)
-    }
-    
-    // 2. Extract SignedData: serialized identity + signature + payload.
+
+    // 4. Extract SignedData: serialized identity + signature + payload.
     signedData, err := protoutil.EnvelopeAsSignedData(envelope)
     if err != nil {
         return nil, status.Errorf(codes.InvalidArgument,
-        "failed to extract signed data: %v", err)
+            "failed to extract signed data: %v", err)
     }
 
+    // 5. Read the resource-to-policy map from the latest bundle.
+    bundle := s.bundleProvider.GetBundle()
     appConfig, exists := bundle.ApplicationConfig()
     if !exists {
         return nil, status.Error(codes.Internal, "no application config in bundle")
     }
-    
-    // 3. Map the gRPC method to an ACL resource name and retrieve
-    //    the corresponding policy from the channel config bundle.
-	resourcePolicy := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
-	
-    policyMgr := s.currentBundle.PolicyManager()
-    policy, exists := policyMgr.GetPolicy(resourcePolicy)
+
+    policyRef := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
+
+    policy, exists := bundle.PolicyManager().GetPolicy(policyRef)
     if !exists {
         return nil, status.Errorf(codes.PermissionDenied,
-        "no policy defined for resource: %s", resource)
+            "no policy defined for resource: %s", info.FullMethod)
     }
-    
-    // 4. Evaluate: verify the signature and validate the identity
+
+    // 6. Evaluate: verify the signature and validate the identity
     //    against the channel's MSP definitions.
     if err := policy.EvaluateSignedData(signedData); err != nil {
         return nil, status.Errorf(codes.PermissionDenied,
-        "ACL check failed for [%s]: %v", resource, err)
+            "ACL check failed for [%s]: %v", info.FullMethod, err)
     }
-    
+
     return handler(ctx, req)
 }
 ```
 
-**Stream interceptor with sequence-based caching.**
+**Stream interceptor with a session-bound cache.**
 
-Streaming services — `blockDelivery` and `OpenNotificationStream` —
-require every message to carry a full signed envelope.
-This is not optional:
-on a bundle update we need to re-evaluate both the identity (against the updated MSP set)
-and the policy decision (against the updated `ACLs` section),
-and that re-evaluation needs the original signed data.
+When dealing with a stream, the method is a bit different.
+The stream interceptor is activated only at the start of the stream, when the first envelope is received.
+The first envelope is processed exactly as in the unary interceptor:
+timestamp freshness, TLS certificate hash binding, signature verification, and policy evaluation.
 
-The resolved identity,
-the configuration sequence observed at the first check, and the session's TLS certificate hash are cached.
-Re-evaluation occurs
-when the configuration sequence advances — catching mid-stream changes such as an organization
-being removed from the channel.
+After the first message passes full identity evaluation, a custom stream wrapper is created
+and the validated state is saved in a **session object bound to the stream**.
+Replay is irrelevant from this point on:
+the stream is already established, and the first message was fully validated,
+meaning the client has already proven its permission to access the stream.
+
+The session object stores:
+
+- the resolved **identity** (the original `SignedData`, so it can be re-evaluated later),
+- the **latest accepted bundle**,
+- the **bundle provider**, for loading the latest bundle on a sequence change,
+- the **resource name** of the stream.
+
+On every stream receive **or** send, the wrapper compares the bundle provider's current
+configuration sequence against the cached one.
+If they are the same, identity evaluation is skipped and the message proceeds immediately.
+If the sequence has advanced, the latest bundle is loaded and the cached identity is
+re-evaluated against the new policy set — catching mid-stream changes such as an
+organization being removed from the channel. On failure, the stream is terminated immediately.
 
 ```go
 func (s *Server) ACLStreamInterceptor(
@@ -301,229 +318,147 @@ func (s *Server) ACLStreamInterceptor(
 ) error {
     ctx := ss.Context()
 
-    // 1. Receive first envelope and validate TLS binding.
+    // 1. Receive the first envelope and validate it exactly as a unary call:
+    //    freshness, TLS binding, signed-data extraction, policy evaluation.
     var firstEnvelope *common.Envelope
     if err := ss.RecvMsg(&firstEnvelope); err != nil {
         return status.Errorf(codes.InvalidArgument,
-        "failed to receive first envelope: %v", err)
+            "failed to receive first envelope: %v", err)
     }
 
-    payload, err := protoutil.UnmarshalPayload(firstEnvelope.Payload)
+    signedData, err := s.validateEnvelope(ctx, firstEnvelope) // steps 1-4 of the unary flow
     if err != nil {
-        return status.Errorf(codes.InvalidArgument,
-        "failed to unmarshal payload: %v", err)
+        return err
     }
 
-    chdr, err := protoutil.UnmarshalChannelHeader(payload.Header.ChannelHeader)
-    if err != nil {
-        return status.Errorf(codes.InvalidArgument,
-        "failed to unmarshal channel header: %v", err)
-    }
-
-    if s.mutualTLS {
-        claimedHash := chdr.TlsCertHash
-        actualHash := util.ExtractCertificateHashFromContext(ctx)
-        if len(actualHash) == 0 {
-            return status.Error(codes.Unauthenticated,
-            "client didn't send a TLS certificate")
-    }
-
-    if !bytes.Equal(actualHash, claimedHash) {
-        return status.Error(codes.Unauthenticated,
-        "TLS cert hash mismatch")
-        }
-    }
-
-    // 2. Extract identity for ACL check.
-    signedData, err := protoutil.EnvelopeAsSignedData(firstEnvelope)
-    if err != nil {
-        return status.Errorf(codes.InvalidArgument,
-        "failed to extract signed data: %v", err)
-    }
-
-
-    appConfig, exists := s.currentBundle.ApplicationConfig()
+    bundle := s.bundleProvider.GetBundle()
+    appConfig, exists := bundle.ApplicationConfig()
     if !exists {
-        return nil, status.Error(codes.Internal, "no application config in bundle")
-    }
-    
-    // 3. Map the gRPC method to an ACL resource name and retrieve
-    //    the corresponding policy from the channel config bundle.
-    resourcePolicy := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
-    
-    policyMgr := s.currentBundle.PolicyManager()
-    policy, exists := policyMgr.GetPolicy(resourcePolicy)
-    if !exists {
-        return nil, status.Errorf(codes.PermissionDenied,
-        "no policy defined for resource: %s", resource)
+        return status.Error(codes.Internal, "no application config in bundle")
     }
 
-    policyMgr := s.currentBundle.PolicyManager()
-    policy, exists := policyMgr.GetPolicy(policy)
+    policyRef := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
+    policy, exists := bundle.PolicyManager().GetPolicy(policyRef)
     if !exists {
         return status.Errorf(codes.PermissionDenied,
-        "no policy for resource: %s", resource)
+            "no policy defined for resource: %s", info.FullMethod)
     }
 
     if err := policy.EvaluateSignedData(signedData); err != nil {
         return status.Errorf(codes.PermissionDenied,
-        "ACL check failed: %v", err)
+            "ACL check failed for [%s]: %v", info.FullMethod, err)
     }
 
-    // 4. Cache identity and sequence for subsequent messages.
+    // 2. Bind the validated state to the stream in a session object.
     session := &SessionAccessControl{
-        signedData:     signedData,
-        configSequence: s.currentBundle.ConfigtxValidator().Sequence(),
-        resource:       resource,
-        tlsCertHash:    chdr.TlsCertHash,
+        signedData:    signedData,        // identity, kept for re-evaluation
+        currentBundle: bundle,            // latest accepted bundle
+        provider:      s.bundleProvider,  // for loading the latest bundle
+        resource:      info.FullMethod,   // resource name
     }
 
     return handler(srv, &aclServerStream{
         ServerStream: ss,
-        server:       s,
         session:      session,
     })
+}
+
+// aclServerStream re-checks the configuration sequence on every message,
+// in both directions.
+func (s *aclServerStream) RecvMsg(m interface{}) error {
+    if err := s.session.checkConfigAndRevalidate(); err != nil {
+        return err
+    }
+    return s.ServerStream.RecvMsg(m)
+}
+
+func (s *aclServerStream) SendMsg(m interface{}) error {
+    if err := s.session.checkConfigAndRevalidate(); err != nil {
+        return err
+    }
+    return s.ServerStream.SendMsg(m)
 }
 ```
 
 **Stream session caching behavior.**
 
-| Situation | Behavior                                                                                                                                                                                                                               |
-|---|----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| **Initial handshake** | Full cryptographic verification (signature + policy evaluation). Identity, configuration sequence, and TLS certificate hash are cached.                                                                                                |
-| **Configuration unchanged** | Sequence matches the cache and the identity did not changed. No cryptographic operation. Request proceeds immediately.                                                                                                                 |
-| **Configuration changed** | `RecvMsg` detects the sequence increment and re-evaluates the cached identity against the updated policy set. If the identity no longer satisfies the policy (e.g., its organization was removed), the stream is terminated immediately. |
+| Situation | Behavior |
+|---|---|
+| **Stream establishment** | Full cryptographic verification of the first envelope (freshness + TLS binding + signature + policy evaluation). Identity, bundle, bundle provider, and resource name are saved in the session object. |
+| **Configuration unchanged** | The provider's sequence matches the cached bundle's sequence. No cryptographic operation; the message proceeds immediately. This check runs on every receive and every send. |
+| **Configuration changed** | The sequence advance is detected on the next receive or send. The latest bundle is loaded and the cached identity is re-evaluated against the new policy set. If the identity no longer satisfies the policy (e.g., its organization was removed), the stream is terminated immediately. |
 
 ---
 
-### Option B — Mutual TLS-Based ACL Enforcement
+### From per-request to per-connection
 
-The client's identity is obtained from the mTLS certificate presented during the handshake.
-No envelope wrapping is required and the existing proto APIs are unchanged.
-A custom `TransportCredentials` wrapper resolves the certificate to an MSP identity at handshake time;
-the gRPC interceptor then reads this pre-resolved identity from the connection's `AuthInfo` on each call
-and evaluates it against the channel's Policy Manager.
+Option A requires a lot of client boilerplate and breaking changes in three proto files.
+It also requires the same connection to send its identity proof to the server over and over again,
+even though nothing about the connection has changed between calls.
 
-For this to work,
-the client's organizational (MSP)
-identity must be embedded in the TLS certificate
-so that the same certificate satisfies both the transport handshake and the MSP `DeserializeIdentity` path. 
-A change in the `fabric-x-common`/`fabric-ca` CA certs providers is required to issue such certificates.
+If we want to avoid that — send a signed envelope only once and cache the connection's identity —
+some RPC still has to receive a signed envelope for the initial identity acquisition.
+Which RPC should it be?
 
-**Identity resolution at handshake.*
-Identity resolution runs once during the mTLS handshake via a custom `TransportCredentials` wrapper. 
-The wrapper iterates the channel MSPs to derive an `msp.Identity` from the client certificate
-and attaches it to the connection's `AuthInfo`;
-from that point on, this identity *is* the identity of the connection.
-Every subsequent RPC reuses it and evaluates it against the current bundle's policy.
-If the bundle has changed in a way that invalidates the identity—for example,
-the client's organization was removed from the channel—the policy evaluation fails naturally, and the call is rejected.
+Rather than electing one of the existing business RPCs, we dedicate one:
+a common authenticator service with a single `Authorize` RPC.
+This is Option B.
 
-**Precondition.
-Option B requires mTLS.
-Without a client certificate there is no identity to evaluate, and ACL enforcement cannot run at all.
+### Option B — Authorize RPC with Connection-Level Identity Binding
+
+The client first calls a dedicated `Authorize(signedEnvelope)` unary RPC on a new `AuthService`,
+presenting its signed envelope there.
+The verified identity is bound to the gRPC connection itself,
+and every subsequent RPC on that connection — unary or streaming — reuses the bound identity.
+
+This requires introducing the `AuthService` and a corresponding proto file, but crucially,
+it does not introduce breaking changes to any existing service APIs.
+The service is simply registered on the sidecar and query service gRPC servers.
+The same gRPC connection can then be used to create an auth client,
+bind the identity at the connection level,
+and be reused by the query and sidecar clients with the bound information.
+
+**Replay prevention.**
+The `Authorize` envelope is processed with the same checks as Option A's envelopes:
+the `ChannelHeader` timestamp is validated for freshness,
+and the TLS certificate hash is compared against the presenting connection's certificate under mTLS.
+A captured `Authorize` envelope therefore expires quickly and cannot be bound from another connection.
+After authorization, no further envelopes travel on the connection, so there is nothing left to capture and replay.
+
+**Execution flow.**
+
+1. **Custom handshake.** A custom `TransportCredentials` wrapper delegates the TLS handshake to the underlying TLS credentials and then injects a custom, mutable `MSPAuthInfo` struct as the connection's `AuthInfo`. This struct lives for the duration of the connection and initially carries only the TLS information.
+2. **Identity resolution.** The `AuthService` is registered on the same gRPC server. When a client invokes the `Authorize` RPC, a dedicated `AuthorizeInterceptor` validates the signed envelope, extracts the client's identity, and safely binds it (together with the current configuration sequence) to the connection's `MSPAuthInfo`.
+3. **Evaluation.** Because the identity is now bound to the physical connection, for every subsequent RPC the ACL interceptors simply read the pre-resolved identity from `MSPAuthInfo` and evaluate it against the channel's policies.
 
 **Pros.**
 
-- No breaking changes to existing proto files.
-- No client-side boilerplate; the client just presents its certificate as usual.
+- No breaking changes to existing proto files; only a new `AuthService` proto is added.
+- The identity proof (envelope construction + signing) is paid once per connection, not once per call.
+- Unary and streaming RPCs share the same enforcement path: read bound identity, evaluate policy.
 
 **Cons.**
 
-- Collapses the conceptual separation between transport identity (TLS CA) and organizational identity (MSP CA).
+- Introduces a new service and connection-scoped mutable state.
+- Clients must call `Authorize` before any other RPC on the connection.
 
-**Server-side flow.**
 
-1. During the mTLS handshake, the custom `TransportCredentials` wrapper resolves the client certificate to an `msp.Identity` by iterating the channel MSPs and attaches it to the connection's `AuthInfo` at resolution time. A certificate that no MSP recognizes causes the handshake to fail with `Unauthenticated`.
-2. On each RPC, the interceptor reads the pre-resolved identity from `AuthInfo` and evaluates it against the current bundle's policy. If the bundle changed in a way that invalidates the identity, the evaluation fails naturally.
-3. Map `info.FullMethod` to a resource name and look up the policy in the bundle's `PolicyManager`.
-4. Invoke `policy.EvaluateIdentities([]msp.Identity{identity})` to perform the policy check.
+> The code below reflects the intended implementation.
 
-> As with Option A, the code below is pseudocode.
-
-**Unary interceptor.**
+**Custom AuthInfo and TransportCredentials wrapper.**
 
 ```go
-func (s *Server) ACLInterceptor(
-    ctx context.Context,
-    req interface{},
-    info *grpc.UnaryServerInfo,
-    handler grpc.UnaryHandler,
-) (interface{}, error) {
-
-    p, ok := peer.FromContext(ctx)
-    if !ok {
-        return nil, status.Error(codes.Unauthenticated, "no peer found")
-    }
-
-    authInfo, ok := p.AuthInfo.(*MSPAuthInfo)
-    if !ok {
-        return nil, status.Error(codes.Unauthenticated,
-            "connection did not complete MSP resolution")
-    }
-
-    // Identity is already resolved — no MSP iteration here.
-    identity := authInfo.Identity
-
-    resource := methodToResource(info.FullMethod)
-    policy, exists := s.currentBundle.PolicyManager().GetPolicy(resource)
-    if !exists {
-        return nil, status.Errorf(codes.PermissionDenied,
-            "no policy defined for resource: %s", resource)
-    }
-
-    if err := policy.EvaluateIdentities([]msp.Identity{identity}); err != nil {
-        return nil, status.Errorf(codes.PermissionDenied,
-            "ACL check failed for [%s]: %v", resource, err)
-    }
-
-    return handler(ctx, req)
-}
-```
-
-**Streaming under Option B.**
-
-The streaming model under Option B is materially simpler than under Option A.
-The TLS certificate is fixed for the lifetime of the connection—gRPC negotiates it once at handshake time—and the resolved `msp.Identity` is attached to `AuthInfo` then and there.
-As a result:
-
-- **Identity does not need to be re-derived per message.** The MSP-iteration step runs once at handshake time, before the stream begins; the resolved identity is reused for the life of the connection.
-- **Per-message work reduces to a policy re-evaluation, and only when the configuration sequence advances.** On each received message the interceptor compares the cached sequence with `s.currentBundle.ConfigtxValidator().Sequence()`. If equal, the call proceeds with no further work. If advanced, the cached identity is re-evaluated against the updated policy set and, if it no longer satisfies the policy, the stream is terminated.
-- **Certificate expiration and revocation are handled by the gRPC/TLS layer.** A connection whose certificate becomes invalid is torn down at the transport layer.
-
-**TLS certificate vs. MSP signing certificate.** Fabric distinguishes two certificates per client:
-
-- The **TLS certificate** authenticates the transport connection. It is issued by the channel's TLS CA and proves network-level identity.
-- The **MSP signing certificate** signs proposals and envelopes. It is issued by the organization's MSP CA and proves organizational identity.
-
-Option B requires either embedding organizational identity into the TLS certificate or issuing the TLS certificate from a CA trusted by the MSP.
-
-
-## Option C — Authentication RPC For Identity Resolution
-
-Option C is a hybrid approach in which the client first calls a dedicated `Authorize(signedEnvelope)` RPC, presenting its signed envelope there. This requires introducing a new `AuthService` and a corresponding proto file, but crucially, it does not introduce breaking changes to any existing service APIs.
-
-This option utilizes the `BundleProvider` and interceptor architecture, with the interceptor logic branching based on the specific gRPC method being invoked.
-
-### Execution Flow
-
-To map a single authenticated identity across multiple RPCs without requiring an envelope on every call, we leverage gRPC's ability to maintain connection-scoped state:
-
-1. **Custom Handshake**: A custom `TransportCredentials` wrapper intercepts the TLS `ServerHandshake`. During the handshake, it creates and injects a custom, mutable `MSPAuthInfo` struct into the connection's underlying context.
-
-2. **Identity Resolution**: The `AuthService` is registered on the same gRPC server. When a client invokes the `Authorize` RPC, the interceptor extracts the client's identity from the signed envelope and safely binds it to the `MSPAuthInfo` struct.
-
-3. **Evaluation**: Because the identity is now bound to that physical session, for every subsequent RPC, the interceptor simply reads the pre-resolved client identity from the connection's `MSPAuthInfo` and evaluates it against the channel's policies.
-
-
-### Custom AuthInfo Structure and TransportCredentials Wrapper
-
-```go
+// MSPAuthInfo implements credentials.AuthInfo and holds MSP authentication state.
+// This struct is attached to the gRPC connection during the TLS handshake and
+// lives for the duration of the connection.
 type MSPAuthInfo struct {
     mu             sync.RWMutex
-    MSPIdentity    msp.Identity      // Bound after Authorize
-    ConfigSequence uint64             // Config version
-    TLSInfo        credentials.TLSInfo
+    MSPIdentity    msp.Identity
+    ConfigSequence uint64
+    TLSCert        *x509.Certificate
+    TLSCertHash    []byte
+
+    TLSInfo credentials.AuthInfo
 }
 
 func (a *MSPAuthInfo) GetIdentity() (msp.Identity, uint64) {
@@ -533,187 +468,300 @@ func (a *MSPAuthInfo) GetIdentity() (msp.Identity, uint64) {
 }
 
 // SetIdentity binds an MSP identity to this connection.
-func (m *MSPAuthInfo) SetIdentity(identity msp.Identity, sequence uint64) {
-    m.mu.Lock()
-    defer m.mu.Unlock()
-    m.MSPIdentity = identity
-    m.ConfigSequence = sequence
+func (a *MSPAuthInfo) SetIdentity(identity msp.Identity, sequence uint64) {
+    a.mu.Lock()
+    defer a.mu.Unlock()
+    a.MSPIdentity = identity
+    a.ConfigSequence = sequence
 }
 
 type CustomCredentials struct {
     tlsCreds credentials.TransportCredentials
 }
 
+// NewCustomCredentials creates new custom credentials that wrap existing TLS credentials.
+// If tlsCreds is nil, it will use insecure credentials (for testing only).
+func NewCustomCredentials(tlsCreds credentials.TransportCredentials) credentials.TransportCredentials {
+    if tlsCreds == nil {
+        tlsCreds = insecure.NewCredentials()
+    }
+    return &CustomCredentials{tlsCreds: tlsCreds}
+}
+
+// ClientHandshake delegates to TLS credentials, then adds custom auth info.
+func (c *CustomCredentials) ClientHandshake(
+    ctx context.Context, authority string, rawConn net.Conn,
+) (net.Conn, credentials.AuthInfo, error) {
+    conn, tlsAuthInfo, err := c.tlsCreds.ClientHandshake(ctx, authority, rawConn)
+    if err != nil {
+        return nil, nil, fmt.Errorf("TLS handshake failed: %w", err)
+    }
+    return conn, &MSPAuthInfo{TLSInfo: tlsAuthInfo}, nil
+}
+
+// ServerHandshake delegates to TLS credentials, then adds custom auth validation.
 func (c *CustomCredentials) ServerHandshake(rawConn net.Conn) (net.Conn, credentials.AuthInfo, error) {
-    logger.Infof("Performing TLS handshake from: %s\n", rawConn.RemoteAddr().String())
-    
-    // Delegate to the underlying TLS credentials to perform the handshake
+    logger.Infof("Performing TLS handshake from: %s", rawConn.RemoteAddr().String())
+
     conn, tlsAuthInfo, err := c.tlsCreds.ServerHandshake(rawConn)
     if err != nil {
         return nil, nil, fmt.Errorf("TLS handshake failed: %w", err)
     }
-    
-    return conn, &MSPAuthInfo{
-        TLSInfo: tlsAuthInfo,
-    }, nil
+
+    return conn, &MSPAuthInfo{TLSInfo: tlsAuthInfo}, nil
 }
 ```
 
-### Interceptor Logic
+**Authorize interceptor.**
 
 ```go
-func MSPUnaryServerInterceptor(provider BundleProvider) grpc.UnaryServerInterceptor {
-    return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, 
-                handler grpc.UnaryHandler) (interface{}, error) {
-        
-        authInfo := extractMSPAuthInfo(ctx)
-        
-        // Handle Authorize RPC
-        if strings.EqualFold(info.FullMethod, "/servicepb.AuthService/Authorize") {
-            bundle, err := provider.GetBundle()
-			if errors.Is(err, ErrNoUpdater) {
-                // Internal service - should not call Authorize
-                return &AuthorizeResponse{
-                    Success: false, 
-                    Message: "Not available for internal services",
-                }, nil
-            }
-            if err != nil {
-                // Configuration problem
-                return &AuthorizeResponse{
-                    Success: false, 
-                    Message: "Channel configuration not available",
-                }, nil
-            }
-            
-            // Extract and validate identity from signed envelope
-            identity, mspID, err := ExtractIdentityFromEnvelope(
-                req.SignedEnvelope, 
-                bundle,
-            )
-            if err != nil {
-                return &AuthorizeResponse{
-                    Success: false, 
-                    Message: "Identity validation failed: " + err.Error(),
-                }, nil
-            }
-
-            authInfo.SetIdentity(identity, bundle.ConfigtxValidator().Sequence())
-            
+// AuthorizeInterceptor creates a gRPC interceptor specifically for the Authorize RPC.
+// This interceptor validates the signed envelope and binds the MSP identity to the connection.
+//
+// Behavior:
+//   - Services with registered DynamicTLSUpdater: Processes authorization
+//   - Services without updater (internal services): Returns error (should not call Authorize)
+//   - Missing bundle when updater is registered: Returns error (configuration problem)
+func AuthorizeInterceptor(provider BundleProvider) grpc.UnaryServerInterceptor {
+    return func(
+        ctx context.Context,
+        req interface{},
+        info *grpc.UnaryServerInfo,
+        handler grpc.UnaryHandler,
+    ) (interface{}, error) {
+        // Only intercept the Authorize RPC.
+        if !strings.EqualFold(info.FullMethod, AuthenticationResource) {
             return handler(ctx, req)
         }
-		
+
+        p, ok := peer.FromContext(ctx)
+        if !ok {
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: ErrNoPeerInfo.Error(),
+            }, nil
+        }
+
+        authInfo, ok := p.AuthInfo.(*MSPAuthInfo)
+        if !ok {
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: ErrNoMSPAuthInfo.Error(),
+            }, nil
+        }
+
         bundle, err := provider.GetBundle()
         if errors.Is(err, ErrNoUpdater) {
-            // Internal service - bypass authentication
-            return handler(ctx, req)
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: "Authorization not available for internal services",
+            }, nil
         }
         if err != nil {
-            // Public service with missing config - fail
-            return nil, status.Error(codes.Internal, 
-                "channel configuration not available")
-        }
-        
-        // Public service - enforce ACL
-        identity, configSeq := authInfo.GetIdentity()
-        
-        // Check if identity is bound
-        if identity == nil {
-            return nil, status.Error(codes.Unauthenticated, 
-                "connection not authorized: call Authorize RPC first")
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: "Channel configuration not available: " + err.Error(),
+            }, nil
         }
 
-        appConfig, exists := bundle.ApplicationConfig()
-        if !exists {
-            return nil, status.Error(codes.Internal, "no application config in bundle")
+        authReq, ok := req.(*committerpb.AuthorizeRequest)
+        if !ok {
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: "Invalid request type",
+            }, nil
         }
-        policyRef := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
-		
-        // Evaluate against policy
-        policyMgr := bundle.PolicyManager()
-        policy, exists := policyMgr.GetPolicy(policyRef)
-        if !exists {
-            return nil, status.Error(codes.PermissionDenied, 
-                "no policy defined for resource")
+
+        signedEnvelope := authReq.GetSignedEnvelope()
+        if signedEnvelope == nil {
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: "Signed envelope is required",
+            }, nil
         }
-        
-        if err := policy.EvaluateIdentities([]msp.Identity{identity}); err != nil {
-            return nil, status.Errorf(codes.PermissionDenied, 
-                "access denied for %s: %v", info.FullMethod, err)
+
+        // Validates freshness + TLS binding, verifies the signature, and
+        // resolves the identity against the channel MSPs.
+        identity, mspID, _, err := ExtractIdentityFromEnvelope(signedEnvelope, bundle)
+        if err != nil {
+            return &committerpb.AuthorizeResponse{
+                Success: false,
+                Message: "Failed to extract identity: " + err.Error(),
+            }, nil
         }
-        
+
+        logger.Infof("Binding identity to connection: identity=%s, mspID=%s",
+            identity.GetIdentifier(), mspID)
+        authInfo.SetIdentity(identity, bundle.ConfigtxValidator().Sequence())
+
         return handler(ctx, req)
     }
 }
+```
 
+**Unary enforcement interceptor.**
 
-func MSPStreamServerInterceptor(provider BundleProvider) grpc.StreamServerInterceptor {
-    return func(srv interface{}, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-        ctx := ss.Context()
-        authInfo := extractMSPAuthInfo(ctx)
-        
-        // Check service type
+```go
+// MSPUnaryServerInterceptor creates a gRPC interceptor for MSP-based access control on unary RPCs.
+func MSPUnaryServerInterceptor(provider BundleProvider) grpc.UnaryServerInterceptor {
+    return func(
+        ctx context.Context,
+        req interface{},
+        info *grpc.UnaryServerInfo,
+        handler grpc.UnaryHandler,
+    ) (interface{}, error) {
+        // Skip authorization check for the Authorize RPC itself.
+        if strings.EqualFold(info.FullMethod, AuthenticationResource) {
+            return handler(ctx, req)
+        }
+
+        p, ok := peer.FromContext(ctx)
+        if !ok {
+            return nil, status.Error(codes.Unauthenticated, ErrNoPeerInfo.Error())
+        }
+
+        authInfo, ok := p.AuthInfo.(*MSPAuthInfo)
+        if !ok {
+            return nil, status.Error(codes.Internal, ErrNoMSPAuthInfo.Error())
+        }
+
         bundle, err := provider.GetBundle()
-            if errors.Is(err, ErrNoUpdater) {
-            // Internal service - bypass authentication
+        if errors.Is(err, ErrNoUpdater) {
+            // No updater = internal service = bypass MSP auth check.
+            return handler(ctx, req)
+        }
+        if err != nil {
+            // ErrNoBundle or any other error = FAIL (enforce ACL).
+            return nil, status.Error(codes.Internal,
+                "channel configuration not available: "+err.Error())
+        }
+
+        // Bundle exists = public service = ENFORCE MSP auth.
+        identity, _ := authInfo.GetIdentity()
+        if identity == nil {
+            return nil, status.Error(codes.Unauthenticated,
+                "connection not authorized: call Authorize first")
+        }
+
+        // Evaluate policy on every unary call (no caching needed for short-lived RPCs).
+        if err := evaluatePolicy(bundle, identity, info.FullMethod); err != nil {
+            return nil, err
+        }
+
+        return handler(ctx, req)
+    }
+}
+```
+
+**Stream enforcement interceptor and wrapped stream.**
+
+```go
+// MSPStreamServerInterceptor creates a gRPC stream interceptor for MSP-based access control.
+//
+// The wrapped stream checks for config sequence changes on every RecvMsg/SendMsg call.
+// If the config changed, it re-evaluates the identity against the new policy.
+func MSPStreamServerInterceptor(provider BundleProvider) grpc.StreamServerInterceptor {
+    return func(
+        srv interface{},
+        ss grpc.ServerStream,
+        info *grpc.StreamServerInfo,
+        handler grpc.StreamHandler,
+    ) error {
+        ctx := ss.Context()
+        p, ok := peer.FromContext(ctx)
+        if !ok {
+            return status.Error(codes.Unauthenticated, ErrNoPeerInfo.Error())
+        }
+
+        authInfo, ok := p.AuthInfo.(*MSPAuthInfo)
+        if !ok {
+            return status.Error(codes.Internal, ErrNoMSPAuthInfo.Error())
+        }
+
+        bundle, err := provider.GetBundle()
+        if errors.Is(err, ErrNoUpdater) {
+            // Internal service - bypass authentication.
             return handler(srv, ss)
         }
         if err != nil {
-            return status.Error(codes.Internal, "channel configuration not available")
+            // Public service with missing config - fail.
+            return status.Error(codes.Internal,
+                "channel configuration not available: "+err.Error())
         }
-        
-        // Public service - enforce ACL
+
+        // Public service - enforce ACL.
         identity, _ := authInfo.GetIdentity()
         if identity == nil {
             return status.Error(codes.Unauthenticated,
-				"connection not authorized: call Authorize RPC first")
+                "connection not authorized: call Authorize RPC first")
         }
 
-        appConfig, exists := bundle.ApplicationConfig()
-        if !exists {
-          return nil, status.Error(codes.Internal, "no application config in bundle")
+        // Initial policy evaluation.
+        if err := evaluatePolicy(bundle, identity, info.FullMethod); err != nil {
+            return err
         }
-        
-        policyRef := appConfig.APIPolicyMapper().PolicyRefForAPI(info.FullMethod)
-		
-        policy, exists := bundle.PolicyManager().GetPolicy(policyRef)
-        if !exists {
-            return status.Error(codes.PermissionDenied, "no policy defined")
+
+        // Wrap the stream for config change detection and re-evaluation.
+        wrappedStream := &authServerStream{
+            ServerStream:  ss,
+            authInfo:      authInfo,
+            provider:      provider,
+            fullMethod:    info.FullMethod,
+            currentBundle: bundle, // cached bundle to detect changes
         }
-        
-        if err := policy.EvaluateIdentities([]msp.Identity{identity}); err != nil {
-            return status.Errorf(codes.PermissionDenied,
-            "access denied for %s: %v", info.FullMethod, err)
-        }
-        
-        return handler(srv, ss)
+
+        return handler(srv, wrappedStream)
     }
 }
 
+// authServerStream wraps grpc.ServerStream to add config change detection
+// and identity re-evaluation on every message.
+type authServerStream struct {
+    grpc.ServerStream
+    authInfo      *MSPAuthInfo
+    provider      BundleProvider
+    fullMethod    string
+    currentBundle *channelconfig.Bundle
+}
+
+// RecvMsg intercepts incoming messages to perform config change detection.
+func (s *authServerStream) RecvMsg(m interface{}) error {
+    if err := s.checkConfigAndRevalidate(); err != nil {
+        return err
+    }
+    return s.ServerStream.RecvMsg(m)
+}
+
+// SendMsg intercepts outgoing messages to perform config change detection.
+func (s *authServerStream) SendMsg(m interface{}) error {
+    if err := s.checkConfigAndRevalidate(); err != nil {
+        return err
+    }
+    return s.ServerStream.SendMsg(m)
+}
 ```
 
 # Drawbacks
 [drawbacks]: #drawbacks
-
-- **Per-call cost.** Every unary RPC pays for a policy evaluation.
-- **Option A specifically.** Breaking changes to three proto files force every existing client to be updated. Clients must implement envelope construction, signing, and TLS certificate hash inclusion.
-
+- **Option A specifically.** Breaking changes to three proto files force every existing client to be updated. Clients must implement envelope construction, signing, timestamping, and TLS certificate hash inclusion — on every request.
+- **Option B specifically.** Introduces a new service, a proto file, and connection-scoped mutable state. Clients must call `Authorize` before any other RPC on a connection.
 
 # Prior art
 [prior-art]: #prior-art
 
 Hyperledger Fabric uses essentially the model proposed here (A).
 
-**gRPC services and message types.
+**gRPC services and message types.**
 Fabric's ACL framework rests on two primary signed protobuf message types.
-The first, `SignedProposal`, 
+The first, `SignedProposal`,
 is used for chaincode execution and ledger interactions;
 it is handled by the `Endorser.ProcessProposal()` gRPC service
 and is the standard for invoking smart contracts or querying the ledger via system chaincodes.
 The second, `common.Envelope`, is used for retrieving blocks from the network via the Delivery service,
 implemented on both orderer and peer, which streams blocks to clients.
 
-**Endorser service flow and ACL integration.**The lifecycle of a chaincode invocation begins at the Endorser Service.
+**Endorser service flow and ACL integration.**
+The lifecycle of a chaincode invocation begins at the Endorser Service.
 Defined in `peer.proto`, the `ProcessProposal` gRPC method is the entry point for all client proposals.
 When a `SignedProposal` reaches the gRPC handler, the system performs a multi-step validation:
 the proposal is unpacked and validated for message integrity,
@@ -726,12 +774,12 @@ Fabric's design employs a two-tier ACL architecture:
 - **Application chaincodes.** The ACL check occurs at the endorser level, validating against `/Channel/Application/Writers` before chaincode execution.
 - **System chaincodes (QSCC, CSCC, lifecycle).** The endorser-level ACL check is skipped. Each system chaincode instead performs its own internal ACL check inside its `Invoke()` method. For example, QSCC extracts the `SignedProposal` from the stub and validates it against function-specific policies (e.g., `qscc/GetBlockByNumber` requires `/Channel/Application/Readers`).
 
-**Policy mapping and configuration storage.
+**Policy mapping and configuration storage.**
 ACL rules in Fabric are governed by a two-level system:
 hardcoded default resource-to-policy mappings and dynamic policy definitions within the channel configuration.
 The `defaultACLProviderImpl` is the central logic gate for the peer.
 It maps the requested resource (such as `peer/Propose` or `qscc/GetBlockByNumber`) to a specific policy
-(such as `/Channel/Application/Writers` or `/Channel/Application/Readers`). 
+(such as `/Channel/Application/Writers` or `/Channel/Application/Readers`).
 A key feature of this provider is its ability
 to handle multiple input types—including `SignedProposal` and `common.Envelope` —
 converting them into a uniform `SignedData` structure for final policy evaluation.
@@ -751,15 +799,10 @@ a `Readers` policy defined as "ANY Readers"
 is satisfied by a signature from any organization member with the Reader role.\
 Committer-X will reuse these same policy definitions directly from the channel configuration bundle.
 
-# Unresolved questions
+# Decisions to be made
 [unresolved-questions]: #unresolved-questions
 
 - **Option A vs. Option B.** This RFC presents both options for team discussion and does not pre-select one. The trade-offs are spelled out per option above.
-- **Resource naming convention.** The examples in this RFC use `service/method` (e.g., `query/GetTransactionStatus`). The alternative is `package/method`.
-- **Behavior of in-flight streams on configuration change.** When a new configuration block arrives, streams established under the previous configuration are still alive. If the new block removes an organization, that organization's streams keep processing until the change is detected. Three paths:
-    - **(a) Lazy re-authorization.** Re-authorize on the next received message; terminate if the client no longer passes. Trade-off: a bounded staleness window between block arrival and next message.
-    - **(b) Tear down all streams.** Close every active stream on any configuration block; clients reconnect. Clean, but disrupts unaffected clients and risks a reconnect burst.
-    - **(c) Proactive re-authorization.** Re-authorize active sessions in the background on a new bundle; terminate only those that fail. Cleanness of (b) without the disruption, at the cost of extra bookkeeping.
 
 # Dependencies
 [dependencies]: #dependencies
@@ -767,4 +810,4 @@ Committer-X will reuse these same policy definitions directly from the channel c
 - The MSP, policy, and channel-configuration packages from `fabric-x-common` (`protoutil`, `msp`, `policies`, channel-config bundle construction).
 - `sampleconfig/configtx.yaml` in `fabric-x-common` to add a sample `ACLs` section.
 - **For Option A:** coordinated changes to `query.proto`, `notify.proto`, and `block_query.proto`, and corresponding client library updates.
-- **For Option B:** changes to the `fabric-x-common`/`fabric-ca` CA certs provider to set the organizational identity in TLS certificates.
+- **For Option B:** a new `AuthService` proto (`AuthorizeRequest`/`AuthorizeResponse`) and registration of the service on the sidecar and query service gRPC servers.
